@@ -1,8 +1,12 @@
 from keras.models import Sequential
+from keras.models import model_from_json
 from keras.layers import convolutional
-from keras.layers.core import Activation, Reshape
+from keras.layers.core import Activation, Flatten
 import keras.backend as K
-from preprocessing import Preprocess
+from AlphaGo.preprocessing.preprocessing import Preprocess
+from AlphaGo.util import flatten_idx
+import json
+
 
 class CNNPolicy(object):
 	"""uses a convolutional neural network to evaluate the state of the game
@@ -22,55 +26,61 @@ class CNNPolicy(object):
 		"""Construct a function using the current keras backend that, when given a batch
 		of inputs, simply processes them forward and returns the output
 
+		The output has size (batch x 361) for 19x19 boards (i.e. the output is a batch
+		of distributions over flattened boards. See AlphaGo.util#flatten_idx)
+
 		This is as opposed to model.compile(), which takes a loss function
 		and training method.
 
 		c.f. https://github.com/fchollet/keras/issues/1426
 		"""
-		model_input = self.model.get_input(train=False)
-		model_output = self.model.get_output(train=False)
-		forward_function = K.function([model_input], [model_output])
+		forward_function = K.function([self.model.input], [self.model.output])
 
 		# the forward_function returns a list of tensors
 		# the first [0] gets the front tensor.
-		# this tensor, however, has dimensions (1, width, height)
-		# and we just want (width,height) hence the second [0]
-		return lambda inpt: forward_function(inpt)[0][0]
+		return lambda inpt: forward_function([inpt])[0]
 
 	def batch_eval_state(self, state_gen, batch=16):
 		"""Given a stream of states in state_gen, evaluates them in batches
 		to make best use of GPU resources.
 
-		Returns: TBD (stream of results? that would break zip(). 
+		Returns: TBD (stream of results? that would break zip().
 			streaming pairs of pre-zipped (state, result)?)
 		"""
 		raise NotImplementedError()
 
-	def eval_state(self, state):
+	def eval_state(self, state, moves=None):
 		"""Given a GameState object, returns a list of (action, probability) pairs
 		according to the network outputs
+
+		If a list of moves is specified, only those moves are kept in the distribution
 		"""
 		tensor = self.preprocessor.state_to_tensor(state)
 
 		# run the tensor through the network
-		network_output = self.forward([tensor])
+		network_output = self.forward(tensor)
+
+		moves = moves or state.get_legal_moves()
+		move_indices = [flatten_idx(m, state.size) for m in moves]
 
 		# get network activations at legal move locations
 		# note: may not be a proper distribution by ignoring illegal moves
-		return [((x,y), network_output[x,y]) for (x,y) in state.get_legal_moves()]
+		distribution = network_output[0][move_indices]
+		distribution = distribution / distribution.sum()
+		return zip(moves, distribution)
 
 	@staticmethod
 	def create_network(**kwargs):
 		"""construct a convolutional neural network.
 
 		Keword Arguments:
-		- input_dim:         depth of features to be processed by first layer (no default)
-		- board:             width of the go board to be processed (default 19)
-		- filters_per_layer: number of filters used on every layer (default 128)
-		- layers:            number of convolutional steps (default 12)
-		- filter_width_K:    (where K is between 1 and <layers>) width of filter on 
-							 layer K (default 3 except 1st layer which defaults to 5).
-							 Must be odd.
+		- input_dim:         	depth of features to be processed by first layer (no default)
+		- board:             	width of the go board to be processed (default 19)
+		- filters_per_layer: 	number of filters used on every layer (default 128)
+		- layers:            	number of convolutional steps (default 12)
+		- filter_width_K:    	(where K is between 1 and <layers>) width of filter on
+								layer K (default 3 except 1st layer which defaults to 5).
+								Must be odd.
 		"""
 		defaults = {
 			"board": 19,
@@ -98,7 +108,7 @@ class CNNPolicy(object):
 			border_mode='same'))
 
 		# create all other layers
-		for i in range(2,params["layers"]+1):
+		for i in range(2, params["layers"] + 1):
 			# use filter_width_K if it is there, otherwise use 3
 			filter_key = "filter_width_%d" % i
 			filter_width = params.get(filter_key, 3)
@@ -118,31 +128,37 @@ class CNNPolicy(object):
 			init='uniform',
 			border_mode='same'))
 		# reshape output to be board x board
-		network.add(Reshape((params["board"],params["board"])))
+		network.add(Flatten())
 		# softmax makes it into a probability distribution
 		network.add(Activation('softmax'))
 
 		return network
 
-	def load_model(self, json_file):
-		"""load the architecture specified in json_file into 'self'
+	@staticmethod
+	def load_model(json_file):
+		"""create a new CNNPolicy object from the architecture specified in json_file
 		"""
-		raise NotImplementedError()
+		with open(json_file, 'r') as f:
+			object_specs = json.load(f)
+		new_policy = CNNPolicy(object_specs['feature_list'])
+		new_policy.model = model_from_json(object_specs['keras_model'])
+		new_policy.forward = new_policy._model_forward()
+		return new_policy
 
 	def save_model(self, json_file):
 		"""write the network model and preprocessing features to the specified file
 		"""
-		raise NotImplementedError()
-
-	def load_params(self, h5_file):
-		"""load model parameters (weights) in the specified file
-		"""
-		raise NotImplementedError()
-
-	def save_params(self, h5_file):
-		"""save model parameters (weights) to the specified file
-		"""
-		raise NotImplementedError()
-
-if __name__ == '__main__':
-	pol = CNNPolicy(["board", "sensibleness"])
+		# this looks odd because we are serializing a model with json as a string
+		# then making that the value of an object which is then serialized as
+		# json again.
+		# It's not as crazy as it looks. A CNNPolicy has 2 moving parts - the
+		# feature preprocessing and the neural net, each of which gets a top-level
+		# entry in the saved file. Keras just happens to serialize models with JSON
+		# as well. Note how this format makes load_model fairly clean as well.
+		object_specs = {
+			'keras_model': self.model.to_json(),
+			'feature_list': self.preprocessor.feature_list
+		}
+		# use the json module to write object_specs to file
+		with open(json_file, 'w') as f:
+			json.dump(object_specs, f)
